@@ -1,0 +1,1 @@
+# text → chunks with metadata (size, overlap)

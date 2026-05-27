@@ -1,0 +1,1 @@
+# chunks → vectors (OpenAI / nomic)
