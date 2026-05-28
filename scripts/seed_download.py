@@ -7,8 +7,8 @@ from app.ingest.download import download_pdf
 
 SEED_URLS = [
     "https://www.medicare.gov/publications/10050-le-medicare-and-you.pdf",
-    "https://www.medicare.gov/publications/10050-medicare-and-you.pdf"
-    # add more URLs here
+    "https://www.medicare.gov/publications/10050-medicare-and-you.pdf",
+    "https://www.cms.gov/medicare/prescription-drug-coverage/limitedincomeandresources/downloads/consumer-mailings.pdf"
 ]
 
 def run():
