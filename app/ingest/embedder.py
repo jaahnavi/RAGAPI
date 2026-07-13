@@ -1,14 +1,11 @@
-# chunks → vectors (OpenAI / nomic)
-from langchain_community.embeddings import OllamaEmbeddings
-
+from langchain_openai import OpenAIEmbeddings
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from typing import List
 
 CHROMA_DIR = "data/chroma"
 
-embeddings = OllamaEmbeddings(model="nomic-embed-text")
-
+embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
 
 def embed_and_store(chunks: List[Document], doc_id: int) -> None:
     """
