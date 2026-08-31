@@ -1,15 +1,19 @@
 # POST /documents/upload, GET /documents, DELETE /documents/{id}
 
-import os
+import logging
 from fastapi import APIRouter, BackgroundTasks, UploadFile, File, Depends, HTTPException
-from sqlalchemy.orm import Session
+from azure.cosmos.container import ContainerProxy
+
 from app.database import get_db
 from app.services.documentservice import download_pdf, save_uploaded_pdf
 from app.ingest.pipeline import run_pipeline_background
 from app.models.schemas import PDFRequest
-from app.models.document import Documents
+from app.repositories import document_repository as repo
+from app.storage.azure_blob import delete_blob
 from langchain_chroma import Chroma
 from app.ingest.embedder import embeddings, CHROMA_DIR
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/documents", tags=["documents"])
 
@@ -18,9 +22,10 @@ router = APIRouter(prefix="/documents", tags=["documents"])
 def upload_document(
     request: PDFRequest,
     background_tasks: BackgroundTasks,
-    db: Session = Depends(get_db),
+    container: ContainerProxy = Depends(get_db),
 ):
-    doc, is_new = download_pdf(request.url, db)
+
+    doc, is_new = download_pdf(request.url, container)
     if is_new:
         background_tasks.add_task(run_pipeline_background, doc.id)
     return {
@@ -34,11 +39,12 @@ def upload_document(
 async def upload_file(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
-    db: Session = Depends(get_db),
+    container: ContainerProxy = Depends(get_db),
 ):
     try:
-        doc, is_new = await save_uploaded_pdf(file, db)
+        doc, is_new = await save_uploaded_pdf(file, container)
     except Exception as e:
+        logger.warning("file upload rejected: %s", e)
         raise HTTPException(status_code=400, detail=str(e))
     if is_new:
         background_tasks.add_task(run_pipeline_background, doc.id)
@@ -50,8 +56,8 @@ async def upload_file(
 
 
 @router.get("/")
-def get_all_status(db: Session = Depends(get_db)):
-    docs = db.query(Documents).order_by(Documents.created_at.desc()).all()
+def get_all_status(container: ContainerProxy = Depends(get_db)):
+    docs = repo.list_all(container)
     return {
         "total": len(docs),
         "documents": [
@@ -70,21 +76,27 @@ def get_all_status(db: Session = Depends(get_db)):
 
 
 @router.delete("/{doc_id}")
-def delete_document(doc_id: int, db: Session = Depends(get_db)):
-    doc = db.query(Documents).filter(Documents.id == doc_id).first()
+def delete_document(doc_id: str, container: ContainerProxy = Depends(get_db)):
+    doc = repo.get_by_id(container, doc_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
 
-    vectorstore = Chroma(
-        collection_name="health_insurance",
-        embedding_function=embeddings,
-        persist_directory=CHROMA_DIR,
-    )
-    vectorstore.delete(where={"doc_id": doc_id})
+    try:
+        vectorstore = Chroma(
+            collection_name="health_insurance",
+            embedding_function=embeddings,
+            persist_directory=CHROMA_DIR,
+        )
+        vectorstore.delete(where={"doc_id": doc_id})
+    except Exception:
+        logger.exception("failed to delete vectors for doc_id=%s", doc_id)
+        raise HTTPException(status_code=500, detail="Failed to delete document vectors")
 
-    if doc.filepath and os.path.exists(doc.filepath):
-        os.remove(doc.filepath)
+    if doc.filepath:
+        try:
+            delete_blob(doc.filepath)
+        except Exception:
+            logger.exception("failed to remove blob %s for doc_id=%s", doc.filepath, doc_id)
 
-    db.delete(doc)
-    db.commit()
+    repo.delete(container, doc_id)
     return {"success": True, "deleted_id": doc_id}

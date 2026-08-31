@@ -4,17 +4,13 @@ import uuid
 import requests
 from urllib.parse import urlparse
 from fastapi import UploadFile
-from sqlalchemy.orm import Session
+from azure.cosmos.container import ContainerProxy
+from app.config import settings
 from app.models.document import Documents
+from app.repositories import document_repository as repo
+from app.storage.azure_blob import upload_blob
 
-SEED_DIR = "data/seed"
-UPLOAD_DIR = "data/uploads"
-
-os.makedirs(SEED_DIR, exist_ok=True)
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-
-ALLOWED_DOMAINS = {"medicare.gov", "cms.gov", "healthcare.gov"}
-
+ALLOWED_DOMAINS = settings.allowed_download_domains
 
 def _extract_filename_from_url(url: str) -> str:
     path = urlparse(url).path
@@ -22,10 +18,15 @@ def _extract_filename_from_url(url: str) -> str:
     return name if name.endswith(".pdf") else f"{name}.pdf"
 
 
-def download_pdf(url: str, db: Session) -> tuple[Documents, bool]:
-    existing = db.query(Documents).filter(Documents.source_url == url).first()
+def download_pdf(url: str, container: ContainerProxy) -> tuple[Documents, bool]:
+    existing = repo.get_by_source_url(container, url)
     if existing:
         return existing, False
+
+    parsed = urlparse(url)
+
+    if parsed.netloc not in ALLOWED_DOMAINS:
+        raise Exception("Domain not allowed")
 
     response = requests.get(url, timeout=60, stream=True)
     if response.status_code != 200:
@@ -38,34 +39,31 @@ def download_pdf(url: str, db: Session) -> tuple[Documents, bool]:
 
     content_hash = hashlib.sha256(content).hexdigest()
 
-    existing_by_hash = db.query(Documents).filter(Documents.content_hash == content_hash).first()
+    existing_by_hash = repo.get_by_content_hash(container, content_hash)
     if existing_by_hash:
         return existing_by_hash, False
 
-    file_uuid = str(uuid.uuid4())
+    doc_id = str(uuid.uuid4())
     original_filename = _extract_filename_from_url(url)
-    filepath = os.path.join(SEED_DIR, f"{file_uuid}.pdf")
+    blob_name = f"seed/{doc_id}.pdf"
 
-    with open(filepath, "wb") as f:
-        f.write(content)
+    blob_url = upload_blob(blob_name, content)
 
     doc = Documents(
-        uuid=file_uuid,
+        id=doc_id,
         filename=original_filename,
-        filepath=filepath,
+        filepath=blob_url,
         source_url=url,
         content_hash=content_hash,
         source_type="seed",
         status="processing",
     )
-    db.add(doc)
-    db.commit()
-    db.refresh(doc)
+    doc = repo.create(container, doc)
 
     return doc, True
 
 
-async def save_uploaded_pdf(file: UploadFile, db: Session) -> tuple[Documents, bool]:
+async def save_uploaded_pdf(file: UploadFile, container: ContainerProxy) -> tuple[Documents, bool]:
     if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise Exception("Only PDF files are accepted. Please upload a .pdf file.")
 
@@ -76,28 +74,25 @@ async def save_uploaded_pdf(file: UploadFile, db: Session) -> tuple[Documents, b
 
     content_hash = hashlib.sha256(content).hexdigest()
 
-    existing = db.query(Documents).filter(Documents.content_hash == content_hash).first()
+    existing = repo.get_by_content_hash(container, content_hash)
     if existing:
         return existing, False
 
-    file_uuid = str(uuid.uuid4())
+    doc_id = str(uuid.uuid4())
     original_filename = file.filename
-    filepath = os.path.join(UPLOAD_DIR, f"{file_uuid}.pdf")
+    blob_name = f"uploads/{doc_id}.pdf"
 
-    with open(filepath, "wb") as f:
-        f.write(content)
+    blob_url = upload_blob(blob_name, content)
 
     doc = Documents(
-        uuid=file_uuid,
+        id=doc_id,
         filename=original_filename,
-        filepath=filepath,
+        filepath=blob_url,
         source_url=None,
         content_hash=content_hash,
         source_type="upload",
         status="processing",
     )
-    db.add(doc)
-    db.commit()
-    db.refresh(doc)
+    doc = repo.create(container, doc)
 
     return doc, True

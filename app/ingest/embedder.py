@@ -3,11 +3,13 @@ from langchain_chroma import Chroma
 from langchain_core.documents import Document
 from typing import List
 
-CHROMA_DIR = "data/chroma"
+from app.config import settings
 
-embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+CHROMA_DIR = settings.chroma_dir
 
-def embed_and_store(chunks: List[Document], doc_id: int) -> None:
+embeddings = OpenAIEmbeddings(model=settings.embedding_model)
+
+def embed_and_store(chunks: List[Document], doc_id: str) -> None:
     """
     Embeds chunks and stores them in Chroma with doc_id in metadata.
     """
@@ -16,9 +18,9 @@ def embed_and_store(chunks: List[Document], doc_id: int) -> None:
         chunk.metadata["doc_id"] = doc_id
 
     vectorstore = Chroma(
-        collection_name="health_insurance",
+        collection_name=settings.collection_name,
         embedding_function=embeddings,
-        persist_directory=CHROMA_DIR
+        persist_directory=settings.chroma_dir
     )
 
     vectorstore.add_documents(chunks)

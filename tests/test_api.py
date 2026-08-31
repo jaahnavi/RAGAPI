@@ -1,39 +1,68 @@
 """
 API endpoint tests.
 
-Uses an in-memory SQLite database (StaticPool so all sessions share one
-connection) via FastAPI dependency override. Heavy operations — PDF parsing,
-embeddings, LLM — are mocked so no external services are required.
+Uses an in-memory fake Cosmos DB container (FakeCosmosContainer) via FastAPI
+dependency override, so no real Azure Cosmos account is required. Heavy
+operations — PDF parsing, embeddings, LLM — are mocked so no external
+services are required either.
 """
 from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from azure.cosmos.exceptions import CosmosResourceNotFoundError
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
 
-from app.database import Base, get_db
+from app.database import get_db
 from app.models.document import Documents
 from main import app
 
-# ── test database ─────────────────────────────────────────────────────────────
+# ── fake Cosmos container ───────────────────────────────────────────────────
 
-_test_engine = create_engine(
-    "sqlite:///:memory:",
-    connect_args={"check_same_thread": False},
-    poolclass=StaticPool,
-)
-_TestSession = sessionmaker(bind=_test_engine)
+
+class FakeCosmosContainer:
+    """Minimal in-memory double for azure.cosmos's ContainerProxy, covering
+    only the operations app.repositories.document_repository relies on."""
+
+    def __init__(self):
+        self._items: dict[str, dict] = {}
+
+    def create_item(self, body):
+        self._items[body["id"]] = dict(body)
+        return dict(body)
+
+    def upsert_item(self, body):
+        self._items[body["id"]] = dict(body)
+        return dict(body)
+
+    def read_item(self, item, partition_key=None):
+        try:
+            return dict(self._items[item])
+        except KeyError:
+            raise CosmosResourceNotFoundError(message="not found")
+
+    def delete_item(self, item, partition_key=None):
+        if item not in self._items:
+            raise CosmosResourceNotFoundError(message="not found")
+        del self._items[item]
+
+    def query_items(self, query, parameters=None, enable_cross_partition_query=False):
+        items = list(self._items.values())
+        params = {p["name"]: p["value"] for p in (parameters or [])}
+        if "@url" in params:
+            items = [i for i in items if i.get("source_url") == params["@url"]]
+        elif "@hash" in params:
+            items = [i for i in items if i.get("content_hash") == params["@hash"]]
+        if "ORDER BY c.created_at DESC" in query:
+            items = sorted(items, key=lambda i: i["created_at"], reverse=True)
+        return items
+
+
+_fake_container = FakeCosmosContainer()
 
 
 def _override_get_db():
-    db = _TestSession()
-    try:
-        yield db
-    finally:
-        db.close()
+    yield _fake_container
 
 
 app.dependency_overrides[get_db] = _override_get_db
@@ -43,10 +72,9 @@ app.dependency_overrides[get_db] = _override_get_db
 
 @pytest.fixture(autouse=True)
 def reset_db():
-    """Recreate all tables before each test and drop them after."""
-    Base.metadata.create_all(_test_engine)
+    """Clear the fake container before each test."""
+    _fake_container._items.clear()
     yield
-    Base.metadata.drop_all(_test_engine)
 
 
 @pytest.fixture
@@ -56,41 +84,35 @@ def client():
 
 @pytest.fixture
 def inserted_doc():
-    """Insert a completed document into the test DB and yield it detached."""
-    db = _TestSession()
+    """Insert a completed document into the test container and yield it."""
     doc = Documents(
-        uuid="aaaabbbb-cccc-dddd-eeee-ffffffffffff",
+        id="aaaabbbb-cccc-dddd-eeee-ffffffffffff",
         filename="uploaded.pdf",
-        filepath="data/uploads/uploaded.pdf",
+        filepath="uploads/uploaded.pdf",
         content_hash="a" * 64,
         status="done",
     )
-    db.add(doc)
-    db.commit()
-    db.refresh(doc)
-    db.expunge(doc)   # detach so the session can be released safely
-    db.close()
+    _fake_container.create_item(doc.to_item())
     yield doc
 
 
 def _fake_doc(status="done"):
     """Return an unsaved Documents instance suitable for use in mocks."""
     return Documents(
-        id=1,
-        uuid="fake-uuid-0001",
+        id="fake-uuid-0001",
         filename="sample.pdf",
-        filepath="data/uploads/sample.pdf",
+        filepath="uploads/sample.pdf",
         content_hash="b" * 64,
         status=status,
         error=None,
-        created_at=datetime.now(timezone.utc),
-        updated_at=datetime.now(timezone.utc),
+        created_at=datetime.now(timezone.utc).isoformat(),
+        updated_at=datetime.now(timezone.utc).isoformat(),
     )
 
 
 # ── POST /documents/ — file upload ────────────────────────────────────────────
 
-@patch("app.api.documents.run_pipeline")
+@patch("app.api.documents.run_pipeline_background")
 @patch("app.api.documents.save_uploaded_pdf", new_callable=AsyncMock)
 def test_upload_pdf_success(mock_save, mock_pipeline, client):
     mock_save.return_value = (_fake_doc(), True)
@@ -120,7 +142,7 @@ def test_upload_non_pdf_returns_400(mock_save, client):
     assert "PDF" in resp.json()["detail"]
 
 
-@patch("app.api.documents.run_pipeline")
+@patch("app.api.documents.run_pipeline_background")
 @patch("app.api.documents.save_uploaded_pdf", new_callable=AsyncMock)
 def test_upload_duplicate_pdf_returns_already_exists(mock_save, mock_pipeline, client):
     mock_save.return_value = (_fake_doc(), False)  # is_new=False
@@ -139,7 +161,7 @@ def test_upload_duplicate_pdf_returns_already_exists(mock_save, mock_pipeline, c
 
 # ── POST /documents/upload-url ────────────────────────────────────────────────
 
-@patch("app.api.documents.run_pipeline")
+@patch("app.api.documents.run_pipeline_background")
 @patch("app.api.documents.download_pdf")
 def test_upload_url_success(mock_download, mock_pipeline, client):
     mock_download.return_value = (_fake_doc(), True)
@@ -156,7 +178,7 @@ def test_upload_url_success(mock_download, mock_pipeline, client):
     mock_pipeline.assert_called_once()
 
 
-@patch("app.api.documents.run_pipeline")
+@patch("app.api.documents.run_pipeline_background")
 @patch("app.api.documents.download_pdf")
 def test_upload_url_duplicate_skips_pipeline(mock_download, mock_pipeline, client):
     mock_download.return_value = (_fake_doc(), False)
@@ -195,9 +217,9 @@ def test_list_documents_returns_inserted_doc(client, inserted_doc):
 
 # ── DELETE /documents/{id} ────────────────────────────────────────────────────
 
-@patch("app.api.documents.os.path.exists", return_value=False)
+@patch("app.api.documents.delete_blob")
 @patch("app.api.documents.Chroma")
-def test_delete_document_success(mock_chroma, mock_path_exists, client, inserted_doc):
+def test_delete_document_success(mock_chroma, mock_delete_blob, client, inserted_doc):
     mock_chroma.return_value = MagicMock()
 
     resp = client.delete(f"/documents/{inserted_doc.id}")

@@ -1,14 +1,12 @@
-# fetches allowlisted CMS/Medicare PDFs into data/seed/
+# fetches allowlisted CMS/Medicare PDFs into Azure Blob Storage
 import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from app.database import SessionLocal, engine, Base
-import app.models.document  # ensure models are registered before create_all
+from app.database import get_container
+from app.repositories import document_repository as repo
 from app.services.documentservice import download_pdf
-from app.ingest.pipeline import run_pipeline
-
-Base.metadata.create_all(bind=engine)
+from app.ingest.pipeline import run_pipeline_background
 
 SEED_URLS = [
     "https://www.medicare.gov/publications/10050-le-medicare-and-you.pdf",
@@ -18,18 +16,16 @@ SEED_URLS = [
 ]
 
 def run():
-    db = SessionLocal()
-    try:
-        for url in SEED_URLS:
-            print(f"Downloading: {url}")
-            doc, is_new = download_pdf(url, db)
-            if is_new:
-                run_pipeline(doc, db)
-                print(f"Ingested: {doc.filename} (status: {doc.status})")
-            else:
-                print(f"Already exists: {doc.filename}")
-    finally:
-        db.close()
+    container = get_container()
+    for url in SEED_URLS:
+        print(f"Downloading: {url}")
+        doc, is_new = download_pdf(url, container)
+        if is_new:
+            run_pipeline_background(doc.id)
+            doc = repo.get_by_id(container, doc.id)
+            print(f"Ingested: {doc.filename} (status: {doc.status})")
+        else:
+            print(f"Already exists: {doc.filename}")
 
 if __name__ == "__main__":
     run()

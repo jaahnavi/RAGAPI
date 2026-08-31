@@ -7,7 +7,9 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 
-LLM_MODEL = "gpt-4o-mini"
+from app.config import settings
+
+LLM_MODEL = settings.llm_model
 
 _SYSTEM_PROMPT = """\
 You are a health insurance specialist assistant. Answer the user's question \

@@ -8,19 +8,16 @@ from langchain_core.documents import Document
 from langchain_openai import OpenAIEmbeddings
 from rank_bm25 import BM25Okapi
 
-CHROMA_DIR = "data/chroma"
-COLLECTION_NAME = "health_insurance"
-RRF_K = 60  # standard RRF constant
-CONFIDENCE_THRESHOLD = 0  # min vector similarity to attempt an answer
+from app.config import settings
 
-embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+embeddings = OpenAIEmbeddings(model=settings.embedding_model)
 
 
 def _get_vectorstore() -> Chroma:
     return Chroma(
-        collection_name=COLLECTION_NAME,
+        collection_name=settings.collection_name,
         embedding_function=embeddings,
-        persist_directory=CHROMA_DIR,
+        persist_directory=settings.chroma_dir,
     )
 
 
@@ -30,10 +27,10 @@ def _tokenize(text: str) -> List[str]:
 
 def hybrid_search(
     query: str,
-    k: int = 7,
+    k: int = 10,
     fetch_k: int = 20,
     alpha: float = 0.5,
-    score_threshold: float = 0.0,
+    score_threshold: float = settings.score_threshold,
 ) -> List[Document]:
     """
     Hybrid retrieval: dense (Chroma cosine) + sparse (BM25) fused via RRF.
@@ -61,7 +58,7 @@ def hybrid_search(
 
     # Low-confidence guard: if the best vector score is below the threshold,
     # the query has no relevant grounding in the knowledge base.
-    if not vector_hits or max(score for _, score in vector_hits) < CONFIDENCE_THRESHOLD:
+    if not vector_hits or max(score for _, score in vector_hits) < settings.confidence_threshold:
         return []
 
     vector_hits = [(doc, score) for doc, score in vector_hits if score >= score_threshold]
@@ -74,17 +71,22 @@ def hybrid_search(
     )[:fetch_k]
 
     # --- Reciprocal Rank Fusion ---
+    # Skip a side entirely when its weight is zero — otherwise its docs would
+    # still be inserted into rrf with a 0.0 score, leaking past filters like
+    # score_threshold (which only applies to the vector side).
     rrf: dict[str, float] = {}
 
-    for rank, (doc, _) in enumerate(vector_hits):
-        cid = content_to_chroma_id.get(doc.page_content)
-        if cid is None:
-            continue
-        rrf[cid] = rrf.get(cid, 0.0) + alpha / (RRF_K + rank + 1)
+    if alpha > 0:
+        for rank, (doc, _) in enumerate(vector_hits):
+            cid = content_to_chroma_id.get(doc.page_content)
+            if cid is None:
+                continue
+            rrf[cid] = rrf.get(cid, 0.0) + alpha / (settings.rrf_k + rank + 1)
 
-    for rank, idx in enumerate(top_bm25_idx):
-        cid = chroma_ids[idx]
-        rrf[cid] = rrf.get(cid, 0.0) + (1.0 - alpha) / (RRF_K + rank + 1)
+    if alpha < 1:
+        for rank, idx in enumerate(top_bm25_idx):
+            cid = chroma_ids[idx]
+            rrf[cid] = rrf.get(cid, 0.0) + (1.0 - alpha) / (settings.rrf_k + rank + 1)
 
     # Sort by fused score and reconstruct Documents
     top_cids = sorted(rrf, key=lambda c: rrf[c], reverse=True)[:k]
