@@ -9,7 +9,6 @@ Usage:
 """
 import sys
 import os
-import shutil
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -19,16 +18,14 @@ load_dotenv()
 from app.database import get_container
 from app.repositories import document_repository as repo
 from app.ingest.pipeline import run_pipeline_background
-from app.ingest.embedder import CHROMA_DIR
+from app.store.vector_store import create_index, delete_index
 
 
 def run():
-    # 1. Wipe the old vector store — incompatible with new embedding dimensions
-    if os.path.exists(CHROMA_DIR):
-        shutil.rmtree(CHROMA_DIR)
-        print(f"Cleared ChromaDB at {CHROMA_DIR}")
-    else:
-        print("No existing ChromaDB found, starting fresh.")
+    # 1. Wipe the old index — incompatible with new embedding dimensions
+    print("Recreating the Azure AI Search index...")
+    delete_index()
+    create_index()
 
     container = get_container()
     docs = repo.list_all(container)

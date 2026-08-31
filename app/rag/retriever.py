@@ -1,28 +1,21 @@
 from __future__ import annotations
 
-import re
 from typing import List
 
-from langchain_chroma import Chroma
+from azure.search.documents.models import VectorizedQuery
 from langchain_core.documents import Document
 from langchain_openai import OpenAIEmbeddings
-from rank_bm25 import BM25Okapi
 
 from app.config import settings
+from app.store.vector_store import get_search_client
 
-embeddings = OpenAIEmbeddings(model=settings.embedding_model)
+embeddings = OpenAIEmbeddings(
+    model=settings.embedding_model,
+    api_key=settings.azure_openai_embedding_api_key or "not-set",
+    base_url=settings.azure_openai_embedding_endpoint,
+)
 
-
-def _get_vectorstore() -> Chroma:
-    return Chroma(
-        collection_name=settings.collection_name,
-        embedding_function=embeddings,
-        persist_directory=settings.chroma_dir,
-    )
-
-
-def _tokenize(text: str) -> List[str]:
-    return re.findall(r"\w+", text.lower())
+_SELECT_FIELDS = ["id", "content", "doc_id", "filename", "source", "source_type", "page", "chunk_index"]
 
 
 def hybrid_search(
@@ -33,67 +26,53 @@ def hybrid_search(
     score_threshold: float = settings.score_threshold,
 ) -> List[Document]:
     """
-    Hybrid retrieval: dense (Chroma cosine) + sparse (BM25) fused via RRF.
+    Hybrid retrieval via Azure AI Search: dense (vector) + sparse (BM25 full-text),
+    fused server-side with Azure's built-in RRF when both sides are used.
 
-    alpha=1.0 → pure vector, alpha=0.0 → pure BM25.
-    score_threshold filters vector hits below that relevance score before fusion.
+    alpha=1.0 -> vector-only, alpha=0.0 -> keyword-only, anything in between -> hybrid.
+    score_threshold filters hits below that relevance score (@search.score) — note the
+    score scale differs between modes (cosine-like for vector-only, RRF-fused for hybrid,
+    BM25-like for keyword-only), so tune this per alpha rather than assuming one value
+    fits all modes.
     """
-    vectorstore = _get_vectorstore()
+    search_text = None if alpha >= 1.0 else query
 
-    # Load full corpus once — needed to build BM25 index and reconstruct docs
-    corpus = vectorstore.get(include=["documents", "metadatas"])  # ids always returned
-    texts: List[str] = corpus["documents"]
-    metadatas: List[dict] = corpus["metadatas"]
-    chroma_ids: List[str] = corpus["ids"]
+    vector_queries = None
+    if alpha > 0.0:
+        query_vector = embeddings.embed_query(query)
+        vector_queries = [
+            VectorizedQuery(vector=query_vector, k_nearest_neighbors=fetch_k, fields="content_vector")
+        ]
 
-    if not texts:
+    results = get_search_client().search(
+        search_text=search_text,
+        vector_queries=vector_queries,
+        top=fetch_k,
+        select=_SELECT_FIELDS,
+    )
+    hits = list(results)
+
+    if not hits:
         return []
 
-    # O(1) content lookup to map LangChain docs back to their Chroma ID
-    content_to_chroma_id = {text: chroma_ids[i] for i, text in enumerate(texts)}
-    chroma_id_to_idx = {cid: i for i, cid in enumerate(chroma_ids)}
-
-    # --- Dense retrieval ---
-    vector_hits = vectorstore.similarity_search_with_relevance_scores(query, k=fetch_k)
-
-    # Low-confidence guard: if the best vector score is below the threshold,
-    # the query has no relevant grounding in the knowledge base.
-    if not vector_hits or max(score for _, score in vector_hits) < settings.confidence_threshold:
+    # Low-confidence guard: if the best hit is below the threshold, the query
+    # has no relevant grounding in the knowledge base.
+    if max(hit["@search.score"] for hit in hits) < settings.confidence_threshold:
         return []
 
-    vector_hits = [(doc, score) for doc, score in vector_hits if score >= score_threshold]
+    hits = [hit for hit in hits if hit["@search.score"] >= score_threshold][:k]
 
-    # --- Sparse retrieval (BM25) ---
-    bm25 = BM25Okapi([_tokenize(t) for t in texts])
-    bm25_scores = bm25.get_scores(_tokenize(query))
-    top_bm25_idx = sorted(
-        range(len(bm25_scores)), key=lambda i: bm25_scores[i], reverse=True
-    )[:fetch_k]
-
-    # --- Reciprocal Rank Fusion ---
-    # Skip a side entirely when its weight is zero — otherwise its docs would
-    # still be inserted into rrf with a 0.0 score, leaking past filters like
-    # score_threshold (which only applies to the vector side).
-    rrf: dict[str, float] = {}
-
-    if alpha > 0:
-        for rank, (doc, _) in enumerate(vector_hits):
-            cid = content_to_chroma_id.get(doc.page_content)
-            if cid is None:
-                continue
-            rrf[cid] = rrf.get(cid, 0.0) + alpha / (settings.rrf_k + rank + 1)
-
-    if alpha < 1:
-        for rank, idx in enumerate(top_bm25_idx):
-            cid = chroma_ids[idx]
-            rrf[cid] = rrf.get(cid, 0.0) + (1.0 - alpha) / (settings.rrf_k + rank + 1)
-
-    # Sort by fused score and reconstruct Documents
-    top_cids = sorted(rrf, key=lambda c: rrf[c], reverse=True)[:k]
     return [
         Document(
-            page_content=texts[chroma_id_to_idx[cid]],
-            metadata=metadatas[chroma_id_to_idx[cid]],
+            page_content=hit["content"],
+            metadata={
+                "source": hit.get("source"),
+                "filename": hit.get("filename"),
+                "source_type": hit.get("source_type"),
+                "page": hit.get("page"),
+                "chunk_index": hit.get("chunk_index"),
+                "doc_id": hit.get("doc_id"),
+            },
         )
-        for cid in top_cids
+        for hit in hits
     ]

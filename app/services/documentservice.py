@@ -25,7 +25,8 @@ def download_pdf(url: str, container: ContainerProxy) -> tuple[Documents, bool]:
 
     parsed = urlparse(url)
 
-    if parsed.netloc not in ALLOWED_DOMAINS:
+    host = (parsed.hostname or "").lower()
+    if not any(host == d or host.endswith(f".{d}") for d in ALLOWED_DOMAINS):
         raise Exception("Domain not allowed")
 
     response = requests.get(url, timeout=60, stream=True)

@@ -14,7 +14,7 @@ SEED_URLS = [
     "https://www.cms.gov/medicare/prescription-drug-coverage/limitedincomeandresources/downloads/consumer-mailings.pdf",
     "https://www.medicare.gov/publications/11525-medicare-appeals.pdf",
 ]
-
+# allowed_download_domains: set[str] = {"medicare.gov", "cms.gov", "healthcare.gov"}
 def run():
     container = get_container()
     for url in SEED_URLS:

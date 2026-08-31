@@ -7,7 +7,7 @@ operations — PDF parsing, embeddings, LLM — are mocked so no external
 services are required either.
 """
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from azure.cosmos.exceptions import CosmosResourceNotFoundError
@@ -218,10 +218,8 @@ def test_list_documents_returns_inserted_doc(client, inserted_doc):
 # ── DELETE /documents/{id} ────────────────────────────────────────────────────
 
 @patch("app.api.documents.delete_blob")
-@patch("app.api.documents.Chroma")
-def test_delete_document_success(mock_chroma, mock_delete_blob, client, inserted_doc):
-    mock_chroma.return_value = MagicMock()
-
+@patch("app.api.documents.delete_by_doc_id")
+def test_delete_document_success(mock_delete_by_doc_id, mock_delete_blob, client, inserted_doc):
     resp = client.delete(f"/documents/{inserted_doc.id}")
 
     assert resp.status_code == 200

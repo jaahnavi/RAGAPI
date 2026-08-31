@@ -27,7 +27,13 @@ _prompt = ChatPromptTemplate.from_messages([
     ("human", "Context:\n{context}\n\nQuestion: {question}"),
 ])
 
-_llm = ChatOpenAI(model=LLM_MODEL, temperature=0)
+_llm = ChatOpenAI(
+    model=LLM_MODEL,
+    temperature=0,
+    api_key=settings.azure_openai_chat_api_key or "not-set",
+    base_url=settings.azure_openai_chat_endpoint,
+    use_responses_api=True,
+)
 _chain = _prompt | _llm | StrOutputParser()
 
 

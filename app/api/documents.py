@@ -10,8 +10,7 @@ from app.ingest.pipeline import run_pipeline_background
 from app.models.schemas import PDFRequest
 from app.repositories import document_repository as repo
 from app.storage.azure_blob import delete_blob
-from langchain_chroma import Chroma
-from app.ingest.embedder import embeddings, CHROMA_DIR
+from app.store.vector_store import delete_by_doc_id
 
 logger = logging.getLogger(__name__)
 
@@ -82,12 +81,7 @@ def delete_document(doc_id: str, container: ContainerProxy = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Document not found")
 
     try:
-        vectorstore = Chroma(
-            collection_name="health_insurance",
-            embedding_function=embeddings,
-            persist_directory=CHROMA_DIR,
-        )
-        vectorstore.delete(where={"doc_id": doc_id})
+        delete_by_doc_id(doc_id)
     except Exception:
         logger.exception("failed to delete vectors for doc_id=%s", doc_id)
         raise HTTPException(status_code=500, detail="Failed to delete document vectors")
